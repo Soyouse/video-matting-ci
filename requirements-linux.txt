@@ -1,0 +1,4 @@
+onnxruntime
+onnxruntime-ep-webgpu
+numpy
+opencv-python-headless

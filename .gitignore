@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+modeles/*.onnx
+*.log
+*.mp4
+.ci/

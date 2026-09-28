@@ -1,0 +1,3 @@
+onnxruntime-directml
+numpy
+opencv-python-headless
