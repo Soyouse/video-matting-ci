@@ -63,3 +63,22 @@ def session(chemin):
     if premier not in GPU:
         sys.exit(f'ARRÊT : {chemin} retombe sur le processeur ({premier}) au lieu de la carte graphique.')
     return s
+
+
+def ouvrir(chemin):
+    """Point d'entrée unique pour le reste du projet : carte graphique obligatoire, sauf si DETOURAGE_CI=1 (posé
+    UNIQUEMENT par ci.py, jamais dans l'environnement de l'opérateur)."""
+    import os
+    return session_ci(chemin) if os.environ.get('DETOURAGE_CI') == '1' else session(chemin)
+
+
+def session_ci(chemin):
+    """RÉSERVÉ À ci.py sur les machines GitHub, qui n'ont PAS de carte graphique (mesuré 28/09/2026 : DirectML
+    « No devices detected »). Essaie la carte graphique ; à défaut, processeur AVEC le nom du fournisseur affiché,
+    pour prouver que le CODE tourne sur ce système. ⚠️ Ne JAMAIS appeler depuis detourer.py : chez l'opérateur, un
+    repli processeur reste une panne."""
+    try:
+        return session(chemin)
+    except SystemExit as e:
+        print(f'CI SANS CARTE GRAPHIQUE ({e}) : exécution sur processeur pour prouver le code', flush=True)
+        return ort.InferenceSession(chemin, _options(), providers=['CPUExecutionProvider'])

@@ -52,12 +52,12 @@ class Detoureur:
     """Étage carte graphique : RVM (état récurrent) puis, en mode fin, ViTMatte sur la bande."""
 
     def __init__(self, w, h, fin):
-        self.rvm = moteur.session(os.path.join(MOD, 'rvm_resnet50_fp32.onnx'))
+        self.rvm = moteur.ouvrir(os.path.join(MOD, 'rvm_resnet50_fp32.onnx'))
         self.rec = [np.zeros((1, 1, 1, 1), np.float32)] * 4
         self.dr = np.array([0.25], np.float32)
         self.fin = fin
         if fin:
-            self.vm = moteur.session(os.path.join(MOD, 'vitmatte_s_544x960.onnx' if w >= h else 'vitmatte_s_960x544.onnx'))
+            self.vm = moteur.ouvrir(os.path.join(MOD, 'vitmatte_s_544x960.onnx' if w >= h else 'vitmatte_s_960x544.onnx'))
             self.vh, self.vw = self.vm.get_inputs()[0].shape[2:]
         self.w, self.h = w, h
 

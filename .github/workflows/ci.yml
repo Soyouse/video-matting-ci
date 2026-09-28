@@ -32,12 +32,17 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: ${{ matrix.deps }}
-      - uses: FedericoCarboni/setup-ffmpeg@36c6454b5a2348e7794ba2d82a21506605921e3d # v3.1 — épinglé 2026-09-28
-        with:
-          github-token: ${{ github.token }}
-      - name: Vulkan logiciel (Linux sans carte graphique)
+      # ffmpeg par le gestionnaire de paquets de chaque système. ⚠️ L'action FedericoCarboni/setup-ffmpeg v3.1 a été
+      # ESSAYÉE le 28/09/2026 et a échoué : macOS arm64 refusé (« only x64 »), Linux « Failed to read version ».
+      - name: ffmpeg (Linux) + Vulkan logiciel lavapipe (pas de carte graphique sur le runner)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg mesa-vulkan-drivers
+      - name: ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
       - run: python -m pip install -r ${{ matrix.deps }}
       - run: python ci.py
         env:

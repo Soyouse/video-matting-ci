@@ -24,9 +24,13 @@ def telecharger(rel, url):
 
 def main():
     rvm, essai = telecharger(*RVM), telecharger(*ESSAI)
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        # Machines GitHub sans carte graphique : repli processeur AUTORISÉ ici seulement (voir moteur.session_ci).
+        # En local, jamais : la CI locale prouve aussi que la carte graphique est bien utilisée.
+        os.environ['DETOURAGE_CI'] = '1'
     import moteur
-    s = moteur.session(rvm)
-    print(f'SYSTÈME {platform.system()} {platform.machine()} | carte graphique : {s.get_providers()[0]}', flush=True)
+    s = moteur.ouvrir(rvm)
+    print(f'SYSTÈME {platform.system()} {platform.machine()} | fournisseur : {s.get_providers()[0]}', flush=True)
     del s
     env = dict(os.environ, DETOURAGE_RUSH=essai, PYTHONUTF8='1')
     r = subprocess.run([sys.executable, '-m', 'unittest', '-v', 'test_detourer'], cwd=ICI, env=env)
