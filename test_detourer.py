@@ -47,10 +47,33 @@ class Calculs(unittest.TestCase):
         self.assertEqual(detourer.cadence(None, None), 30)
         self.assertEqual(detourer.cadence('24000/1001', '24000/1001'), 24)
 
-    def test_filtre_video(self):
-        self.assertEqual(detourer.filtre_video(30, False), 'fps=30')
-        f = detourer.filtre_video(30, True)
-        self.assertTrue(f.startswith('zscale=') and 'tonemap=' in f and f.endswith(',fps=30'))
+    def test_pq_valeurs_de_reference_st2084(self):
+        # Valeurs publiées de la courbe PQ : code 0 -> 0 nit, code 1 -> 10 000 nits, code 0,5081 -> ~100 nits.
+        np.testing.assert_allclose(calcul.pq_vers_nits(np.array([0.0, 1.0])), [0.0, 10000.0], rtol=1e-4, atol=1e-6)
+        self.assertAlmostEqual(float(calcul.pq_vers_nits(np.array(0.5081))), 100.0, delta=1.0)
+
+    def test_hlg_valeurs_de_reference_bt2100(self):
+        # BT.2100 : signal 0,5 -> lumière relative 1/12 (point de raccord des deux branches), ici crête 1000 nits.
+        self.assertAlmostEqual(float(calcul.hlg_vers_nits(np.array(0.5))), 1000 / 12, places=3)
+        self.assertAlmostEqual(float(calcul.hlg_vers_nits(np.array(1.0))), 1000.0, delta=1.0)
+
+    def test_hdr_vers_sdr_borne_monotone_et_teinte(self):
+        rampe = np.linspace(0, 1, 64, dtype=np.float32)
+        for t in ('smpte2084', 'arib-std-b67'):
+            gris = calcul.hdr_vers_sdr(np.repeat(rampe[None, :, None], 3, axis=2), t)[0, :, 0]
+            self.assertTrue((gris >= 0).all() and (gris <= 1).all())
+            self.assertTrue((np.diff(gris) >= -1e-6).all(), f'{t} : la conversion doit être croissante')
+            self.assertEqual(float(gris[0]), 0.0)
+        # un pixel « peau » garde son ordre de canaux (rouge > vert > bleu) : la teinte n'est pas cassée
+        peau = calcul.hdr_vers_sdr(np.array([[[0.55, 0.50, 0.45]]], np.float32), 'smpte2084')[0, 0]
+        self.assertTrue(peau[0] > peau[1] > peau[2])
+
+    def test_hdr_rapide_egal_formule(self):
+        """La version à tables (utilisée par l'outil) doit égaler la formule de référence à moins de 1/255."""
+        u = (np.random.default_rng(2).random((64, 48, 3)) * 65535).astype(np.uint16)
+        for t in ('smpte2084', 'arib-std-b67'):
+            ecart = np.abs(calcul.hdr16_vers_sdr(u, t) - calcul.hdr_vers_sdr(u.astype(np.float32) / 65535, t)).max()
+            self.assertLess(float(ecart), 1 / 255, t)
 
 
 class Parallelisme(unittest.TestCase):
@@ -186,17 +209,30 @@ class BoutEnBout(unittest.TestCase):
         # 1) le vrai point d'entrée prend le chemin HDR sans refuser ni planter
         _, texte = self._detourer(hdr)
         self.assertIn('HDR converti', texte)
-        # 2) la chaîne de décodage HDR que detourer.py utilise change RÉELLEMENT les pixels (image entière, sans le
-        #    fond de remplacement qui dilue l'écart : mesuré 4/255 sur la vidéo d'essai contre 16/255 sur un rush)
+        # 2) le décodeur que detourer.py utilise change RÉELLEMENT les pixels quand la vidéo est HDR (image entière,
+        #    sans le fond de remplacement qui dilue l'écart)
         images = []
-        for src, marque in ((hdr, True), (sdr, False)):
-            raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', src, '-vf', detourer.filtre_video(fps, marque),
-                                  '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], capture_output=True,
-                                 check=True).stdout
-            images.append(np.frombuffer(raw[:w * h * 3], np.uint8).astype(np.float32))
+        for t in (est_hdr, None):
+            dec, lire = detourer.decodeur(hdr, w, h, fps, t)
+            images.append(lire() * 255)
+            dec.kill(); dec.wait()
         ecart = float(np.abs(images[0] - images[1]).mean())
         print(f'\nHDR : écart moyen image décodée avec conversion vs sans = {ecart:.1f} / 255')
         self.assertGreater(ecart, 10.0, 'la conversion HDR ne semble pas appliquée')
+        # 3) la conversion répartie sur plusieurs cœurs rend les images DANS L'ORDRE et identiques à une conversion
+        #    faite une par une
+        dec, lire = detourer.decodeur(hdr, w, h, fps, est_hdr)
+        paralleles = []
+        while (im := lire()) is not None:
+            paralleles.append(im)
+        dec.wait()
+        raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', hdr, '-vf', f'fps={fps}', '-f', 'rawvideo', '-pix_fmt',
+                              'rgb48le', '-'], capture_output=True, check=True).stdout
+        une_a_une = [calcul.hdr16_vers_sdr(np.frombuffer(raw[i:i + w * h * 6], '<u2').reshape(h, w, 3), est_hdr)
+                     for i in range(0, len(raw), w * h * 6)]
+        self.assertEqual(len(paralleles), len(une_a_une))
+        for a, b in zip(paralleles, une_a_une):
+            np.testing.assert_array_equal(a, b)
 
 
 if __name__ == '__main__':

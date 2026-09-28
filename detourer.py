@@ -21,6 +21,8 @@ pour un fichier de sortie à cadence standard et déterministe.
 Licence : RVM GPL-3.0 (usage interne libre).
 """
 import os, sys, json, time, queue, threading, subprocess
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import numpy as np, cv2
 import moteur, calcul
@@ -28,13 +30,15 @@ import moteur, calcul
 ICI = os.path.dirname(os.path.abspath(__file__))
 MOD = os.path.join(ICI, 'modeles')
 PROFONDEUR = 8
+HDR_COEURS = max(1, min(4, (os.cpu_count() or 2) - 2))  # conversion HDR : laisse 2 cœurs à ffmpeg et à l'incrustation
+HDR_AVANCE = 2 * HDR_COEURS  # images HDR en cours de conversion, bornées
 SORTIES_RVM = ['pha', 'r1o', 'r2o', 'r3o', 'r4o']  # 'fgr' (couleur plein format, ~25 Mo/image) JAMAIS rapatrié : inutilisé
 HDR = {'smpte2084', 'arib-std-b67'}  # PQ (HDR10/HDR10+/Dolby Vision) et HLG : convertis, jamais refusés
 FIN = object()
 
 
 def sonder(video):
-    """-> (largeur, hauteur, cadence fixe de sortie, vidéo HDR ?)."""
+    """-> (largeur, hauteur, cadence fixe de sortie, transfert HDR ou None)."""
     out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
                           'stream=width,height,avg_frame_rate,r_frame_rate,color_transfer:stream_side_data=rotation',
                           '-of', 'json', video], capture_output=True, text=True, check=True).stdout
@@ -43,16 +47,46 @@ def sonder(video):
     rot = next((abs(int(d.get('rotation', 0))) for d in st.get('side_data_list', []) if 'rotation' in d), 0)
     if rot in (90, 270):
         w, h = h, w  # ffmpeg applique la rotation au décodage
-    return w, h, cadence(st.get('avg_frame_rate'), st.get('r_frame_rate')), st.get('color_transfer') in HDR
+    t = st.get('color_transfer')
+    return w, h, cadence(st.get('avg_frame_rate'), st.get('r_frame_rate')), (t if t in HDR else None)
 
 
-def filtre_video(fps, hdr):
-    """Chaîne ffmpeg du décodage. Zéro friction exigée par l'opérateur (28/09/2026) : une vidéo HDR n'est PAS refusée,
-    elle est convertie en couleurs standard (tone mapping « hable », recette zscale documentée par ffmpeg) avant
-    détourage — sinon rgb24 la rendrait délavée. Puis cadence fixe (voir l'en-tête)."""
-    ton = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,'
-           'zscale=t=bt709:m=bt709:r=tv,format=yuv420p,') if hdr else ''
-    return f'{ton}fps={fps}'
+def decodeur(video, w, h, fps, transfert):
+    """Lance ffmpeg en décodage à cadence fixe et rend (processus, lire) ; lire() -> image float32 SDR ou None.
+    Zéro friction exigée par l'opérateur (28/09/2026) : une vidéo HDR n'est PAS refusée. Elle est décodée en 16 bits
+    (rgb48) puis convertie en SDR par calcul.hdr_vers_sdr, en Python pur — JAMAIS par un filtre ffmpeg (zscale absent
+    du ffmpeg de Homebrew, mesuré en CI macOS). La conversion tourne dans l'étage lecture (parallèle)."""
+    fmt, octets = ('rgb48le', 6) if transfert else ('rgb24', 3)
+    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', video, '-vf', f'fps={fps}', '-f', 'rawvideo',
+                            '-pix_fmt', fmt, '-'], stdout=subprocess.PIPE)
+    taille = w * h * octets
+
+    def brut():
+        buf = dec.stdout.read(taille)
+        return None if len(buf) < taille else buf
+
+    if not transfert:
+        def lire():
+            buf = brut()
+            return None if buf is None else np.frombuffer(buf, np.uint8).reshape(h, w, 3).astype(np.float32) / 255
+        return dec, lire
+
+    # HDR : conversion (126 ms/image mesurés en 1080p) répartie sur plusieurs cœurs, ORDRE CONSERVÉ (file de futurs
+    # dépilée dans l'ordre d'arrivée), profondeur BORNÉE à HDR_AVANCE images en mémoire.
+    pool = ThreadPoolExecutor(HDR_COEURS)
+    attente = deque()
+
+    def convertir(buf):
+        return calcul.hdr16_vers_sdr(np.frombuffer(buf, '<u2').reshape(h, w, 3), transfert)
+
+    def lire():
+        while len(attente) < HDR_AVANCE and (buf := brut()) is not None:
+            attente.append(pool.submit(convertir, buf))
+        if not attente:
+            pool.shutdown()
+            return None
+        return attente.popleft().result()
+    return dec, lire
 
 
 def cadence(moyenne, nominale):
@@ -163,23 +197,16 @@ def main():
     if len(args) != 3 or drapeaux - {'--sequentiel'}:
         sys.exit(__doc__)
     video, fspec, sortie = args
-    w, h, fps, hdr = sonder(video)
+    w, h, fps, transfert = sonder(video)
     det = Detoureur()
     bg = fond(fspec, w, h)
     # ⚠️ Écriture sous un nom TEMPORAIRE puis renommage : une vidéo interrompue ne doit jamais avoir l'air finie.
     partiel = os.path.splitext(sortie)[0] + '.partiel.mp4'
-    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', video, '-vf', filtre_video(fps, hdr), '-f', 'rawvideo',
-                            '-pix_fmt', 'rgb24', '-'], stdout=subprocess.PIPE)
+    dec, lire = decodeur(video, w, h, fps, transfert)
     enc = subprocess.Popen(['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{w}x{h}',
                             '-r', str(fps), '-i', '-', '-i', video, '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264',
                             '-crf', '16', '-preset', 'medium', '-pix_fmt', 'yuv420p', '-c:a', 'copy', partiel],
                            stdin=subprocess.PIPE)
-    taille = w * h * 3
-
-    def lire():
-        buf = dec.stdout.read(taille)
-        return None if len(buf) < taille else np.frombuffer(buf, np.uint8).reshape(h, w, 3).astype(np.float32) / 255
-
     t0 = time.time()
     n = traiter(lire, enc.stdin.write, det, bg, parallele='--sequentiel' not in drapeaux)
     enc.stdin.close(); enc.wait(); dec.wait()
@@ -187,7 +214,7 @@ def main():
         sys.exit(f'ÉCHEC ffmpeg (décodage {dec.returncode}, encodage {enc.returncode}) ; sortie partielle : {partiel}')
     os.replace(partiel, sortie)
     tt = time.time() - t0
-    print(f'FINI : {n} images à {fps} i/s{" (HDR converti)" if hdr else ""} en {tt:.1f} s ({n / tt:.1f} images/s) -> {sortie}')
+    print(f'FINI : {n} images à {fps} i/s{" (HDR converti)" if transfert else ""} en {tt:.1f} s ({n / tt:.1f} images/s) -> {sortie}')
 
 
 if __name__ == '__main__':
