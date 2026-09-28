@@ -5,40 +5,28 @@ Sources officielles lues le 28/09/2026 (onnxruntime.ai) :
   et execution_mode=ORT_SEQUENTIAL. DirectML = Windows uniquement.
 - macOS : le paquet standard `onnxruntime` (arm64) inclut CoreMLExecutionProvider ; ModelFormat=MLProgram (macOS 12+),
   MLComputeUnits=ALL. Les opérations non gérées par CoreML retombent sur le processeur (partition partielle, normal).
-- Linux : CUDAExecutionProvider si `onnxruntime-gpu` + carte Nvidia ; sinon WebGPU via le plugin `onnxruntime-ep-webgpu`
-  (Vulkan). WebGPU mesuré 2× plus lent que DirectML sur une RX 7600 : jamais préféré là où DirectML existe.
+- Linux : CUDAExecutionProvider si `onnxruntime-gpu` + carte Nvidia. Linux sans Nvidia = NON PRIS EN CHARGE (refus nommé).
+
+🛑 WebGPU (plugin `onnxruntime-ep-webgpu` 0.4.0) EXCLU, mesuré le 28/09/2026 sur RX 7600 et sur Linux/lavapipe :
+RVM plante (« Shape mismatch attempting to re-use buffer ») ; avec enable_mem_reuse=False il tourne en 55 ms mais rend
+un contour FAUX (63 % des pixels à plus de 5 % d'écart de la référence processeur), SANS AUCUNE ERREUR. Ne jamais le
+réintroduire sans que test_justesse_contre_reference_processeur passe dessus.
+⚠️ Un fournisseur n'est admis que s'il rend le MÊME contour que le processeur (test de justesse) : « ça tourne » ne
+prouve rien. DirectML mesuré exact (écart 0,000000) le 28/09/2026.
 
 ⚠️ NE JAMAIS laisser un calcul partir sur le processeur en silence : si le premier fournisseur de la session n'est pas
 une carte graphique, ARRÊT immédiat avec un message qui dit pourquoi (l'opérateur juge un repli CPU comme une panne).
-État de preuve : Windows + RX 7600 PROUVÉ par exécution (28/09/2026) ; macOS et Linux = INCONNU tant que non exécutés.
 """
 import sys
 import onnxruntime as ort
 
-GPU = ('DmlExecutionProvider', 'CoreMLExecutionProvider', 'CUDAExecutionProvider', 'WebGpuExecutionProvider')
+GPU = ('DmlExecutionProvider', 'CoreMLExecutionProvider', 'CUDAExecutionProvider')
 
 
 def _options():
     so = ort.SessionOptions()
     so.log_severity_level = 3
     return so
-
-
-def _webgpu(so):
-    """Enregistre le plugin WebGPU (Linux sans Nvidia). Retourne False s'il est absent."""
-    try:
-        import onnxruntime_ep_webgpu as wep
-    except ImportError:
-        return False
-    try:
-        ort.register_execution_provider_library('webgpu', wep.get_library_path())
-    except Exception:
-        pass  # déjà enregistré dans ce processus
-    dev = next((d for d in ort.get_ep_devices() if d.ep_name == wep.get_ep_name()), None)
-    if dev is None:
-        return False
-    so.add_provider_for_devices([dev], {})
-    return True
 
 
 def session(chemin):
@@ -54,11 +42,9 @@ def session(chemin):
             ('CoreMLExecutionProvider', {'ModelFormat': 'MLProgram', 'MLComputeUnits': 'ALL'}), 'CPUExecutionProvider'])
     elif 'CUDAExecutionProvider' in dispo:
         s = ort.InferenceSession(chemin, so, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    elif _webgpu(so):
-        s = ort.InferenceSession(chemin, sess_options=so)
     else:
-        sys.exit(f'ARRÊT : aucune carte graphique utilisable sur ce système ({sys.platform}). Installe le paquet '
-                 f'du requirements correspondant (voir LISEZ-MOI.md).')
+        sys.exit(f'ARRÊT : aucune carte graphique prise en charge sur ce système ({sys.platform}) : Windows (DirectML), '
+                 f'macOS (CoreML) ou Linux + Nvidia (CUDA). Voir LISEZ-MOI.md.')
     premier = s.get_providers()[0]
     if premier not in GPU:
         sys.exit(f'ARRÊT : {chemin} retombe sur le processeur ({premier}) au lieu de la carte graphique.')

@@ -94,6 +94,27 @@ class Parallelisme(unittest.TestCase):
         self.assertEqual(empreintes[0], empreintes[1], f'fin={fin} : parallèle ≠ séquentiel')
 
     @unittest.skipUnless(os.environ.get('DETOURAGE_RUSH'), 'DETOURAGE_RUSH absent : pas de rush réel')
+    def test_justesse_contre_reference_processeur(self):
+        """Le fournisseur choisi par moteur.ouvrir DOIT rendre le même contour que le processeur (référence).
+        Né le 28/09/2026 : WebGPU tournait sans erreur et rendait 63 % de pixels faux ; l'équivalence
+        séquentiel/parallèle ne pouvait pas le voir (deux résultats faux identiques)."""
+        import onnxruntime as ort, moteur
+        video = os.environ['DETOURAGE_RUSH']
+        w, h, _ = detourer.dims(video)
+        raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', video, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt',
+                              'rgb24', '-'], capture_output=True, check=True).stdout
+        img = np.frombuffer(raw[:w * h * 3], np.uint8).reshape(h, w, 3).astype(np.float32) / 255
+        x = np.ascontiguousarray(img.transpose(2, 0, 1)[None]); z = [np.zeros((1, 1, 1, 1), np.float32)] * 4
+        feed = {'src': x, 'r1i': z[0], 'r2i': z[1], 'r3i': z[2], 'r4i': z[3], 'downsample_ratio': np.array([0.25], np.float32)}
+        chemin = os.path.join(detourer.MOD, 'rvm_resnet50_fp32.onnx')
+        ref = ort.InferenceSession(chemin, providers=['CPUExecutionProvider']).run(['pha'], feed)[0]
+        s = moteur.ouvrir(chemin)
+        d = np.abs(s.run(['pha'], feed)[0] - ref)
+        print(f'\nJUSTESSE {s.get_providers()[0]} : écart moyen {d.mean():.6f}, pixels > 1 % : {(d > 0.01).mean() * 100:.4f} %')
+        self.assertLess(float(d.mean()), 1e-3)
+        self.assertLess(float((d > 0.01).mean()), 1e-3)
+
+    @unittest.skipUnless(os.environ.get('DETOURAGE_RUSH'), 'DETOURAGE_RUSH absent : pas de rush réel')
     def test_parallele_identique_au_sequentiel_sur_rush_reel(self):
         self._equivalence(False)
 
