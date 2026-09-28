@@ -1,20 +1,27 @@
-"""Détourage vidéo « fond vert sans fond vert » : RVM (contour + mémoire temporelle) puis retouche de la seule bande
-incertaine, incrustation sur un fond, son d'origine conservé. Windows, macOS, Linux (voir moteur.py).
+"""Détourage vidéo « fond vert sans fond vert » : RVM (contour + mémoire temporelle) puis sigmoïde normalisée sur la
+seule bande incertaine, incrustation sur un fond, son d'origine conservé. Windows, macOS, Linux (voir moteur.py).
 
-Usage : python detourer.py <video> <fond> <sortie.mp4> [--fin] [--sequentiel]
+Usage : python detourer.py <video> <fond> <sortie.mp4> [--sequentiel]
   <fond>        image (jpg/png, recadrée pour couvrir) ou couleur hexadécimale (ex. 00b140, vert d'incrustation).
-  (par défaut)  retouche = sigmoïde (calcul.py), ~7 ms/image, choix de l'opérateur le 28/09/2026.
-  --fin         retouche = ViTMatte-S (carte graphique, ~117 ms/image) : mèches plus naturelles, efface mieux les
-                restes d'objets collés à la silhouette.
   --sequentiel  désactive le parallélisme (sert au test d'équivalence : le résultat DOIT être identique au pixel).
 
-⚠️ Réglages MESURÉS le 28/09/2026 (RX 7600, rush face caméra) : RVM downsample 0,25 (0,375 et 0,5 mesurés pires).
+⚠️ SYSTÈME OFFICIEL = RVM + sigmoïde, choisi par l'opérateur le 28/09/2026 sur un rush bien éclairé. Le mode --fin
+(ViTMatte-S) a été RETIRÉ ce jour-là sur son mandat (mèches jugées « trop passées », 2,3× plus lent) ; son dernier
+état est archivé sous l'étiquette git `archive-mode-fin-vitmatte` (voir recherche/MODE-FIN.md). Ne pas le réintroduire
+sans nouvelle décision de l'opérateur.
+⚠️ Réglages MESURÉS le 28/09/2026 (RX 7600) : RVM downsample 0,25 (0,375 et 0,5 mesurés pires).
+⚠️ JAMAIS `-shortest` à l'encodage : mesuré le 28/09/2026 sur un rush de téléphone, 137 images écrites mais 133 dans
+le fichier (4,46 s d'image pour 4,57 s de son) — l'option coupe les dernières images quand le son finit un peu avant.
+Sans elle : 137/137, 4,567 s d'image pour 4,565 s de son. (Le premier diagnostic, « cadence variable », était FAUX :
+un test l'a réfuté en supprimant la conversion de cadence, sans effet sur la synchro.)
+Cadence : on décode quand même en cadence FIXE entière (filtre fps, ex. 29,73 -> 30) et on encode à cette cadence,
+pour un fichier de sortie à cadence standard et déterministe.
 ⚠️ Parallélisme = 3 étages (lecture | carte graphique | incrustation + écriture) reliés par des files BORNÉES
-(PROFONDEUR images max en mémoire : sans borne, une vidéo longue remplirait la RAM). RVM reste strictement séquentiel :
-son état récurrent passe d'une image à la suivante.
-Licences : RVM GPL-3.0 (usage interne libre) ; ViTMatte MIT (poids entraînés sur un jeu Adobe « recherche »).
+(PROFONDEUR images max en mémoire). RVM reste strictement séquentiel : son état récurrent passe d'une image à l'autre.
+Licence : RVM GPL-3.0 (usage interne libre).
 """
 import os, sys, json, time, queue, threading, subprocess
+from fractions import Fraction
 import numpy as np, cv2
 import moteur, calcul
 
@@ -22,19 +29,43 @@ ICI = os.path.dirname(os.path.abspath(__file__))
 MOD = os.path.join(ICI, 'modeles')
 PROFONDEUR = 8
 SORTIES_RVM = ['pha', 'r1o', 'r2o', 'r3o', 'r4o']  # 'fgr' (couleur plein format, ~25 Mo/image) JAMAIS rapatrié : inutilisé
+HDR = {'smpte2084', 'arib-std-b67'}  # PQ (HDR10/HDR10+/Dolby Vision) et HLG : convertis, jamais refusés
 FIN = object()
 
 
-def dims(video):
+def sonder(video):
+    """-> (largeur, hauteur, cadence fixe de sortie, vidéo HDR ?)."""
     out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
-                          'stream=width,height,r_frame_rate:stream_side_data=rotation', '-of', 'json', video],
-                         capture_output=True, text=True, check=True).stdout
+                          'stream=width,height,avg_frame_rate,r_frame_rate,color_transfer:stream_side_data=rotation',
+                          '-of', 'json', video], capture_output=True, text=True, check=True).stdout
     st = json.loads(out)['streams'][0]
     w, h = st['width'], st['height']
     rot = next((abs(int(d.get('rotation', 0))) for d in st.get('side_data_list', []) if 'rotation' in d), 0)
     if rot in (90, 270):
         w, h = h, w  # ffmpeg applique la rotation au décodage
-    return w, h, st['r_frame_rate']
+    return w, h, cadence(st.get('avg_frame_rate'), st.get('r_frame_rate')), st.get('color_transfer') in HDR
+
+
+def filtre_video(fps, hdr):
+    """Chaîne ffmpeg du décodage. Zéro friction exigée par l'opérateur (28/09/2026) : une vidéo HDR n'est PAS refusée,
+    elle est convertie en couleurs standard (tone mapping « hable », recette zscale documentée par ffmpeg) avant
+    détourage — sinon rgb24 la rendrait délavée. Puis cadence fixe (voir l'en-tête)."""
+    ton = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,'
+           'zscale=t=bt709:m=bt709:r=tv,format=yuv420p,') if hdr else ''
+    return f'{ton}fps={fps}'
+
+
+def cadence(moyenne, nominale):
+    """Cadence FIXE de sortie : la cadence moyenne réelle arrondie à l'image entière (téléphone ~29,83 -> 30).
+    Repli sur la cadence nominale si la moyenne est absente ou nulle ; 30 en dernier recours."""
+    for txt in (moyenne, nominale):
+        try:
+            f = Fraction(txt)
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if f > 0:
+            return max(1, round(float(f)))
+    return 30
 
 
 def fond(spec, w, h):
@@ -49,42 +80,24 @@ def fond(spec, w, h):
 
 
 class Detoureur:
-    """Étage carte graphique : RVM (état récurrent) puis, en mode fin, ViTMatte sur la bande."""
+    """Étage carte graphique : RVM seul (état récurrent)."""
 
-    def __init__(self, w, h, fin):
+    def __init__(self):
         self.rvm = moteur.ouvrir(os.path.join(MOD, 'rvm_resnet50_fp32.onnx'))
         self.rec = [np.zeros((1, 1, 1, 1), np.float32)] * 4
         self.dr = np.array([0.25], np.float32)
-        self.fin = fin
-        if fin:
-            self.vm = moteur.ouvrir(os.path.join(MOD, 'vitmatte_s_544x960.onnx' if w >= h else 'vitmatte_s_960x544.onnx'))
-            self.vh, self.vw = self.vm.get_inputs()[0].shape[2:]
-        self.w, self.h = w, h
 
     def __call__(self, img, chw):
-        """img float32 (h, w, 3) et sa copie contiguë (1, 3, h, w) -> (alpha RVM, alpha ViTMatte ou None, bande ou None).
-        En mode par défaut, SEUL RVM tourne ici : la bande et la sigmoïde partent dans l'étage processeur (finir),
-        pour que l'étage carte graphique ne fasse que du calcul carte graphique."""
+        """chw = copie contiguë (1, 3, h, w) de l'image -> alpha RVM (h, w). La bande et la sigmoïde partent dans
+        l'étage processeur (finir), pour que l'étage carte graphique ne fasse que du calcul carte graphique."""
         pha, *self.rec = self.rvm.run(SORTIES_RVM, {'src': chw, 'r1i': self.rec[0], 'r2i': self.rec[1],
-                                               'r3i': self.rec[2], 'r4i': self.rec[3], 'downsample_ratio': self.dr})
-        a = pha[0, 0]
-        if not self.fin:
-            return a, None, None
-        m = calcul.bande(a)
-        tri = np.where(m, 0.5, (a > calcul.SEUIL_HAUT).astype(np.float32)).astype(np.float32)
-        small = cv2.resize(img, (self.vw, self.vh), interpolation=cv2.INTER_AREA)
-        trs = cv2.resize(tri, (self.vw, self.vh), interpolation=cv2.INTER_NEAREST)
-        x = np.concatenate([((small - 0.5) / 0.5).transpose(2, 0, 1), trs[None]], 0)[None].astype(np.float32)
-        return a, cv2.resize(self.vm.run(None, {'input': x})[0][0, 0], (self.w, self.h), interpolation=cv2.INTER_LINEAR), m
+                                                   'r3i': self.rec[2], 'r4i': self.rec[3], 'downsample_ratio': self.dr})
+        return pha[0, 0]
 
 
-def finir(img, a, af, m, bg):
-    """Étage processeur : retouche de la bande puis incrustation -> octets RGB24."""
-    if af is None:
-        a = calcul.sigmoide(a, calcul.bande(a))
-    else:
-        a = a.copy(); a[m] = af[m]
-    return calcul.incruster_octets(img, a.clip(0, 1), bg)
+def finir(img, a, bg):
+    """Étage processeur : sigmoïde sur la bande incertaine puis incrustation -> octets RGB24."""
+    return calcul.incruster_octets(img, calcul.sigmoide(a, calcul.bande(a)).clip(0, 1), bg)
 
 
 def preparer(img):
@@ -100,8 +113,7 @@ def traiter(lire, ecrire, det, bg, parallele=True):
     if not parallele:
         n = 0
         while (img := lire()) is not None:
-            p = preparer(img)
-            ecrire(finir(img, *det(*p), bg)); n += 1
+            ecrire(finir(img, det(*preparer(img)), bg)); n += 1
         return n
     q_in, q_out = queue.Queue(PROFONDEUR), queue.Queue(PROFONDEUR)
     erreurs = []
@@ -131,7 +143,7 @@ def traiter(lire, ecrire, det, bg, parallele=True):
         while (p := q_in.get()) is not FIN:
             if erreurs:  # l'écrivain a échoué : inutile de calculer le reste
                 break
-            q_out.put((p[0], *det(*p))); n += 1
+            q_out.put((p[0], det(*p))); n += 1
         else:
             fin_lue = True
     finally:
@@ -148,17 +160,19 @@ def traiter(lire, ecrire, det, bg, parallele=True):
 def main():
     drapeaux = {x for x in sys.argv[1:] if x.startswith('--')}
     args = [x for x in sys.argv[1:] if not x.startswith('--')]
-    if len(args) != 3 or drapeaux - {'--fin', '--sequentiel'}:
+    if len(args) != 3 or drapeaux - {'--sequentiel'}:
         sys.exit(__doc__)
     video, fspec, sortie = args
-    w, h, fps = dims(video)
-    det = Detoureur(w, h, '--fin' in drapeaux)
+    w, h, fps, hdr = sonder(video)
+    det = Detoureur()
     bg = fond(fspec, w, h)
-    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', video, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
-                           stdout=subprocess.PIPE)
+    # ⚠️ Écriture sous un nom TEMPORAIRE puis renommage : une vidéo interrompue ne doit jamais avoir l'air finie.
+    partiel = os.path.splitext(sortie)[0] + '.partiel.mp4'
+    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', video, '-vf', filtre_video(fps, hdr), '-f', 'rawvideo',
+                            '-pix_fmt', 'rgb24', '-'], stdout=subprocess.PIPE)
     enc = subprocess.Popen(['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{w}x{h}',
-                            '-r', fps, '-i', '-', '-i', video, '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264',
-                            '-crf', '16', '-preset', 'medium', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-shortest', sortie],
+                            '-r', str(fps), '-i', '-', '-i', video, '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264',
+                            '-crf', '16', '-preset', 'medium', '-pix_fmt', 'yuv420p', '-c:a', 'copy', partiel],
                            stdin=subprocess.PIPE)
     taille = w * h * 3
 
@@ -170,9 +184,10 @@ def main():
     n = traiter(lire, enc.stdin.write, det, bg, parallele='--sequentiel' not in drapeaux)
     enc.stdin.close(); enc.wait(); dec.wait()
     if enc.returncode or dec.returncode:
-        sys.exit(f'ÉCHEC ffmpeg (décodage {dec.returncode}, encodage {enc.returncode})')
+        sys.exit(f'ÉCHEC ffmpeg (décodage {dec.returncode}, encodage {enc.returncode}) ; sortie partielle : {partiel}')
+    os.replace(partiel, sortie)
     tt = time.time() - t0
-    print(f'FINI : {n} images en {tt:.1f} s ({n / tt:.1f} images/s) -> {sortie}')
+    print(f'FINI : {n} images à {fps} i/s{" (HDR converti)" if hdr else ""} en {tt:.1f} s ({n / tt:.1f} images/s) -> {sortie}')
 
 
 if __name__ == '__main__':

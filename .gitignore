@@ -4,3 +4,4 @@ modeles/*.onnx
 *.log
 *.mp4
 .ci/
+modeles/**/*.onnx

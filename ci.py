@@ -4,7 +4,7 @@
 2) lance TOUS les tests, dont l'équivalence séquentiel/parallèle sur la vidéo d'essai ;
 3) détoure la vidéo d'essai de bout en bout et vérifie la sortie (flux vidéo, nombre d'images) ;
 4) affiche le système, la carte graphique réellement utilisée et la vitesse.
-Code de sortie ≠ 0 au moindre échec. Le mode --fin (ViTMatte) n'est testé que si ses modèles sont présents."""
+Code de sortie ≠ 0 au moindre échec."""
 import os, sys, json, subprocess, urllib.request, platform
 
 ICI = os.path.dirname(os.path.abspath(__file__))
